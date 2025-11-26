@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
+from async_timeout import timeout
 from bidict import bidict
 
 from hummingbot.connector.constants import s_decimal_NaN
@@ -18,11 +20,13 @@ from hummingbot.connector.exchange.biconomy.biconomy_api_order_book_data_source 
 from hummingbot.connector.exchange.biconomy.biconomy_api_user_stream_data_source import BiconomyAPIUserStreamDataSource
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
+from hummingbot.core.data_type.cancellation_result import CancellationResult
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.event.events import MarketEvent
+from hummingbot.core.utils.async_utils import safe_gather
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
@@ -46,6 +50,22 @@ def _combine_trading_pair(base: str, quote: str) -> str:
 
 class BiconomyExchange(ExchangePyBase):
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
+    BULK_CANCEL_MAX_SIZE = 10
+    _CLIENT_ID_FIELDS = (
+        "client_id",
+        "clientId",
+        "clientOrderId",
+        "client_oid",
+        "clientOid",
+    )
+    _EXCHANGE_ID_FIELDS = (
+        "order_id",
+        "orderId",
+        "id",
+    )
+    _AMOUNT_FIELDS = ("amount", "number", "deal_stock", "size")
+    _PRICE_FIELDS = ("price", "deal_price", "avg_price")
+    _ORDER_MATCH_TOLERANCE = Decimal("0.0001")
 
     web_utils = web_utils
 
@@ -186,6 +206,9 @@ class BiconomyExchange(ExchangePyBase):
             "market": symbol,
             "side": side,
             "amount": f"{amount:f}",
+            "client_id": order_id,
+            "clientOrderId": order_id,
+            "client_oid": order_id,
         }
         endpoint = CONSTANTS.MARKET_ORDER_PATH_URL
         if order_type in (OrderType.LIMIT, OrderType.LIMIT_MAKER):
@@ -199,17 +222,455 @@ class BiconomyExchange(ExchangePyBase):
         return exchange_order_id, update_timestamp
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
+        start_ts = self.current_timestamp
+        refresh_attempted = False
         exchange_order_id = tracked_order.exchange_order_id
         if exchange_order_id is None:
+            refresh_attempted = True
+            self.logger().warning(
+                "Cancel instrumentation: missing exchange id for %s; attempting refresh.",
+                tracked_order.client_order_id,
+            )
+            exchange_order_id = await self._refresh_exchange_order_id(tracked_order)
+        if exchange_order_id is None:
+            self.logger().error(
+                "Cancel instrumentation: refresh failed for %s (age=%.1fs).",
+                tracked_order.client_order_id,
+                max(0.0, start_ts - tracked_order.creation_timestamp),
+            )
             raise IOError("Cannot cancel order without exchange order id on Biconomy.")
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
         payload = {
             "market": symbol,
             "order_id": exchange_order_id,
         }
-        response = await self._api_post(path_url=CONSTANTS.CANCEL_ORDER_PATH_URL, data=payload, is_auth_required=True)
-        self._extract_result(response, context="cancel order")
-        return True
+        self.logger().info(
+            "Cancel instrumentation: submitting cancel order=%s exchange_id=%s symbol=%s refresh_attempted=%s age=%.1fs",
+            tracked_order.client_order_id,
+            exchange_order_id,
+            symbol,
+            refresh_attempted,
+            max(0.0, start_ts - tracked_order.creation_timestamp),
+        )
+        try:
+            response = await self._api_post(path_url=CONSTANTS.CANCEL_ORDER_PATH_URL, data=payload, is_auth_required=True)
+            self._extract_result(response, context="cancel order")
+            self.logger().info(
+                "Cancel instrumentation: cancel acknowledged order=%s exchange_id=%s elapsed=%.3fs",
+                tracked_order.client_order_id,
+                exchange_order_id,
+                max(0.0, self.current_timestamp - start_ts),
+            )
+            return True
+        except IOError as exc:
+            self.logger().warning(
+                "Cancel instrumentation: cancel request errored order=%s exchange_id=%s reason=%s",
+                tracked_order.client_order_id,
+                exchange_order_id,
+                exc,
+            )
+            if self._is_missing_order_error(exc):
+                self._finalize_missing_cancel(tracked_order, str(exc))
+                return True
+            raise
+
+    async def cancel_all(self, timeout_seconds: float) -> List[CancellationResult]:
+        incomplete_orders = [order for order in self.in_flight_orders.values() if not order.is_done]
+        if not incomplete_orders:
+            return []
+
+        order_ids_pending = {order.client_order_id for order in incomplete_orders}
+        successful_cancellations: List[CancellationResult] = []
+
+        try:
+            async with timeout(timeout_seconds):
+                batch_candidates, fallback_orders = await self._build_batch_cancel_candidates(incomplete_orders)
+                batch_successful, batch_failed = await self._execute_batch_cancel(batch_candidates)
+
+                for order in batch_successful:
+                    successful_cancellations.append(CancellationResult(order.client_order_id, True))
+                    order_ids_pending.discard(order.client_order_id)
+
+                fallback_orders.extend(batch_failed)
+                fallback_successes = await self._execute_individual_cancels(fallback_orders)
+                for client_order_id in fallback_successes:
+                    successful_cancellations.append(CancellationResult(client_order_id, True))
+                    order_ids_pending.discard(client_order_id)
+        except Exception:
+            self.logger().network(
+                "Unexpected error cancelling orders.",
+                exc_info=True,
+                app_warning_msg="Failed to cancel order. Check API key and network connection.",
+            )
+
+        failed_cancellations = [CancellationResult(order_id, False) for order_id in order_ids_pending]
+        return successful_cancellations + failed_cancellations
+
+    async def _build_batch_cancel_candidates(
+        self, orders: List[InFlightOrder]
+    ) -> Tuple[List[Tuple[InFlightOrder, Dict[str, str]]], List[InFlightOrder]]:
+        candidates: List[Tuple[InFlightOrder, Dict[str, str]]] = []
+        fallback_orders: List[InFlightOrder] = []
+        for order in orders:
+            exchange_order_id = order.exchange_order_id
+            if exchange_order_id is None:
+                try:
+                    exchange_order_id = await self._refresh_exchange_order_id(order)
+                except Exception as exc:
+                    self.logger().warning(
+                        "Cancel instrumentation: failed to refresh exchange id for %s during batch prep: %s",
+                        order.client_order_id,
+                        exc,
+                    )
+                    fallback_orders.append(order)
+                    continue
+            if exchange_order_id is None:
+                fallback_orders.append(order)
+                continue
+            try:
+                symbol = await self.exchange_symbol_associated_to_pair(order.trading_pair)
+            except Exception as exc:
+                self.logger().warning(
+                    "Cancel instrumentation: unable to derive symbol for %s: %s",
+                    order.client_order_id,
+                    exc,
+                )
+                fallback_orders.append(order)
+                continue
+            payload = {
+                "market": symbol,
+                "order_id": str(exchange_order_id),
+            }
+            candidates.append((order, payload))
+        return candidates, fallback_orders
+
+    async def _execute_batch_cancel(
+        self, candidates: List[Tuple[InFlightOrder, Dict[str, str]]]
+    ) -> Tuple[List[InFlightOrder], List[InFlightOrder]]:
+        successful: List[InFlightOrder] = []
+        failed: List[InFlightOrder] = []
+        if not candidates:
+            return successful, failed
+
+        chunk_count = max(1, (len(candidates) + self.BULK_CANCEL_MAX_SIZE - 1) // self.BULK_CANCEL_MAX_SIZE)
+        self.logger().info(
+            "Cancel instrumentation: attempting batch cancel for %d orders across %d chunk(s).",
+            len(candidates),
+            chunk_count,
+        )
+        for chunk in self._chunk_list(candidates, self.BULK_CANCEL_MAX_SIZE):
+            payload_entries = [payload for _, payload in chunk]
+            order_lookup = {payload["order_id"]: order for order, payload in chunk}
+            try:
+                response = await self._api_post(
+                    path_url=CONSTANTS.BULK_CANCEL_PATH_URL,
+                    data={"orders_json": json.dumps(payload_entries)},
+                    is_auth_required=True,
+                )
+                result_entries = self._extract_entries(
+                    self._extract_result(response, context="bulk cancel orders")
+                )
+            except Exception as exc:
+                self.logger().warning(
+                    "Cancel instrumentation: batch cancel request failed for %d orders: %s",
+                    len(chunk),
+                    exc,
+                )
+                failed.extend(order_lookup.values())
+                continue
+
+            if not result_entries:
+                self.logger().warning(
+                    "Cancel instrumentation: batch cancel response was empty for %d orders; falling back to single cancels.",
+                    len(chunk),
+                )
+                failed.extend(order_lookup.values())
+                continue
+
+            acknowledged_ids = set()
+            for entry in result_entries:
+                if not isinstance(entry, dict):
+                    continue
+                exchange_order_id = str(entry.get("order_id") or "")
+                if not exchange_order_id:
+                    continue
+                acknowledged_ids.add(exchange_order_id)
+                order = order_lookup.get(exchange_order_id)
+                if order is None:
+                    continue
+                if self._is_truthy(entry.get("result")):
+                    self._apply_cancel_update(order)
+                    successful.append(order)
+                else:
+                    self.logger().warning(
+                        "Cancel instrumentation: batch cancel rejected order=%s exchange_id=%s",
+                        order.client_order_id,
+                        order.exchange_order_id,
+                    )
+                    failed.append(order)
+
+            missing_ids = set(order_lookup.keys()) - acknowledged_ids
+            for missing_id in missing_ids:
+                order = order_lookup[missing_id]
+                self.logger().warning(
+                    "Cancel instrumentation: batch cancel response missing order=%s exchange_id=%s",
+                    order.client_order_id,
+                    order.exchange_order_id,
+                )
+                failed.append(order)
+
+        return successful, failed
+
+    def _apply_cancel_update(self, order: InFlightOrder):
+        update_timestamp = self.current_timestamp
+        if update_timestamp is None or update_timestamp != update_timestamp:
+            update_timestamp = time.time()
+        order_update = OrderUpdate(
+            client_order_id=order.client_order_id,
+            trading_pair=order.trading_pair,
+            update_timestamp=update_timestamp,
+            new_state=(
+                OrderState.CANCELED
+                if self.is_cancel_request_in_exchange_synchronous
+                else OrderState.PENDING_CANCEL
+            ),
+        )
+        self._order_tracker.process_order_update(order_update)
+
+    async def _execute_individual_cancels(self, orders: List[InFlightOrder]) -> List[str]:
+        if not orders:
+            return []
+        tasks = [self._execute_cancel(order.trading_pair, order.client_order_id) for order in orders]
+        results = await safe_gather(*tasks, return_exceptions=True)
+        successful_ids: List[str] = []
+        for result in results:
+            if isinstance(result, Exception) or result is None:
+                continue
+            successful_ids.append(result)
+        return successful_ids
+
+    @staticmethod
+    def _chunk_list(source: List[Tuple[InFlightOrder, Dict[str, str]]], size: int):
+        for start in range(0, len(source), size):
+            yield source[start:start + size]
+
+    @staticmethod
+    def _is_truthy(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "1", "success"}
+        if isinstance(value, (int, float)):
+            return value != 0
+        return False
+
+    async def _refresh_exchange_order_id(self, tracked_order: InFlightOrder) -> Optional[str]:
+        """Attempt to reload the exchange order id from REST before raising on cancel."""
+        self.logger().info(
+            "Cancel instrumentation: refreshing exchange id for %s (current=%s)",
+            tracked_order.client_order_id,
+            tracked_order.exchange_order_id,
+        )
+        try:
+            symbol = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
+        except Exception:
+            self.logger().debug(
+                "Cancel instrumentation: unable to derive symbol for %s while refreshing exchange id.",
+                tracked_order.client_order_id,
+            )
+            return None
+        order_entry = await self._find_order_entry_via_rest(tracked_order=tracked_order, symbol=symbol)
+        if order_entry is not None:
+            exchange_order_id = self._extract_exchange_order_id(order_entry)
+            if exchange_order_id is not None:
+                tracked_order.update_exchange_order_id(exchange_order_id)
+                self.logger().info(
+                    "Cancel instrumentation: refreshed exchange id for %s -> %s",
+                    tracked_order.client_order_id,
+                    exchange_order_id,
+                )
+            self._sync_tracked_order_with_remote_entry(tracked_order, order_entry)
+            return tracked_order.exchange_order_id
+        order_age = max(0.0, self.current_timestamp - tracked_order.creation_timestamp)
+        self.logger().warning(
+            "Cancel instrumentation: REST refresh could not find %s on Biconomy (age=%.1fs).",
+            tracked_order.client_order_id,
+            order_age,
+        )
+        if order_age > 30:
+            self.logger().warning(
+                "Unable to refresh exchange_order_id for %s after %.1fs; marking order as failed.",
+                tracked_order.client_order_id,
+                order_age,
+            )
+            self._update_order_after_failure(
+                order_id=tracked_order.client_order_id,
+                trading_pair=tracked_order.trading_pair,
+                exception=IOError("order not found while refreshing exchange id"),
+            )
+        return None
+
+    async def _find_order_entry_via_rest(self, tracked_order: InFlightOrder, symbol: str) -> Optional[Dict[str, Any]]:
+        endpoints = (
+            (CONSTANTS.PENDING_ORDERS_PATH_URL, "list pending orders"),
+            (CONSTANTS.FINISHED_ORDERS_PATH_URL, "list finished orders"),
+        )
+        for path_url, context in endpoints:
+            payload = {
+                "market": symbol,
+                "page": 1,
+                "page_size": 200,
+            }
+            try:
+                response = await self._api_post(path_url=path_url, data=payload, is_auth_required=True)
+                entries = self._extract_entries(self._extract_result(response, context=context))
+                self.logger().debug(
+                    "Cancel instrumentation: fetched %d entries from %s for order=%s",
+                    len(entries),
+                    context,
+                    tracked_order.client_order_id,
+                )
+            except Exception as exc:
+                self.logger().debug(
+                    "Failed to fetch %s for %s: %s",
+                    context,
+                    tracked_order.client_order_id,
+                    exc,
+                )
+                continue
+            matched_entry = self._locate_tracked_order_entry(tracked_order, entries)
+            if matched_entry is not None:
+                self.logger().info(
+                    "Cancel instrumentation: located %s for order=%s exchange_id=%s status=%s",
+                    context,
+                    tracked_order.client_order_id,
+                    matched_entry.get("id") or matched_entry.get("order_id"),
+                    matched_entry.get("status"),
+                )
+                return matched_entry
+        return None
+
+    def _locate_tracked_order_entry(self, tracked_order: InFlightOrder, entries: List[Any]) -> Optional[Dict[str, Any]]:
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if self._entry_matches_tracked_order(tracked_order, entry):
+                return entry
+        return None
+
+    def _entry_matches_tracked_order(self, tracked_order: InFlightOrder, entry: Dict[str, Any]) -> bool:
+        client_id = self._extract_client_order_id(entry)
+        if client_id is not None and client_id == tracked_order.client_order_id:
+            return True
+        exchange_order_id = self._extract_exchange_order_id(entry)
+        if exchange_order_id is not None and tracked_order.exchange_order_id is not None:
+            if exchange_order_id == tracked_order.exchange_order_id:
+                return True
+        matches = 0
+        expected_side = CONSTANTS.SIDE_BUY if tracked_order.trade_type is TradeType.BUY else CONSTANTS.SIDE_SELL
+        entry_side = self._coerce_entry_side(entry.get("side") or entry.get("type"))
+        if entry_side is not None:
+            if entry_side != expected_side:
+                return False
+            matches += 1
+        entry_amount = self._decimal_from_entry_fields(entry, self._AMOUNT_FIELDS)
+        if entry_amount > Decimal("0") and tracked_order.amount > Decimal("0"):
+            if self._values_close(entry_amount, tracked_order.amount):
+                matches += 1
+            else:
+                return False
+        entry_price = self._decimal_from_entry_fields(entry, self._PRICE_FIELDS)
+        if tracked_order.price is not None and tracked_order.price > Decimal("0") and entry_price > Decimal("0"):
+            if self._values_close(entry_price, tracked_order.price):
+                matches += 1
+            else:
+                return False
+        return matches >= 2
+
+    def _extract_client_order_id(self, entry: Dict[str, Any]) -> Optional[str]:
+        for field in self._CLIENT_ID_FIELDS:
+            value = entry.get(field)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    def _extract_exchange_order_id(self, entry: Dict[str, Any]) -> Optional[str]:
+        for field in self._EXCHANGE_ID_FIELDS:
+            value = entry.get(field)
+            if value is None:
+                continue
+            try:
+                return str(value)
+            except Exception:
+                continue
+        return None
+
+    def _sync_tracked_order_with_remote_entry(self, tracked_order: InFlightOrder, entry: Dict[str, Any]):
+        try:
+            order_state = self._order_state_from_status(entry)
+        except Exception:
+            return
+        if order_state in {OrderState.CANCELED, OrderState.FILLED, OrderState.FAILED}:
+            update = OrderUpdate(
+                trading_pair=tracked_order.trading_pair,
+                update_timestamp=self._coerce_timestamp(entry.get("mtime") or entry.get("update_time") or entry.get("ctime")),
+                new_state=order_state,
+                client_order_id=tracked_order.client_order_id,
+                exchange_order_id=tracked_order.exchange_order_id,
+            )
+            self._order_tracker.process_order_update(update)
+
+    def _coerce_entry_side(self, side_value: Any) -> Optional[int]:
+        if side_value is None:
+            return None
+        if isinstance(side_value, str):
+            lowered = side_value.lower()
+            if lowered == "buy":
+                return CONSTANTS.SIDE_BUY
+            if lowered == "sell":
+                return CONSTANTS.SIDE_SELL
+            if lowered.isdigit():
+                try:
+                    return int(lowered)
+                except Exception:
+                    return None
+        if isinstance(side_value, (int, float)):
+            try:
+                return int(side_value)
+            except Exception:
+                return None
+        return None
+
+    def _decimal_from_entry_fields(self, entry: Dict[str, Any], fields: Tuple[str, ...]) -> Decimal:
+        for field in fields:
+            if field in entry and entry[field] is not None:
+                return self._decimal_from_value(entry[field])
+        return Decimal("0")
+
+    def _values_close(self, lhs: Decimal, rhs: Decimal) -> bool:
+        if rhs == Decimal("0"):
+            return lhs == rhs
+        tolerance = max(Decimal("1e-8"), rhs.copy_abs() * self._ORDER_MATCH_TOLERANCE)
+        return abs(lhs - rhs) <= tolerance
+
+    def _is_missing_order_error(self, exception: Exception) -> bool:
+        message = str(exception).lower()
+        return "order not found" in message or "does not exist" in message
+
+    def _finalize_missing_cancel(self, tracked_order: InFlightOrder, reason: str):
+        self.logger().warning(
+            "Cancel fallback: order %s not present on exchange (%s). Treating as canceled.",
+            tracked_order.client_order_id,
+            reason,
+        )
+        update = OrderUpdate(
+            trading_pair=tracked_order.trading_pair,
+            update_timestamp=self.current_timestamp,
+            new_state=OrderState.CANCELED,
+            client_order_id=tracked_order.client_order_id,
+            exchange_order_id=tracked_order.exchange_order_id,
+        )
+        self._order_tracker.process_order_update(update)
 
     async def _update_balances(self):
         response = await self._api_post(path_url=CONSTANTS.USER_BALANCES_PATH_URL, is_auth_required=True)
@@ -514,18 +975,28 @@ class BiconomyExchange(ExchangePyBase):
             status = entry.get("status")
             if isinstance(status, str) and status.lower() not in ("trading", "enabled", "online", "active", "1"):
                 continue
+            if "-" in base_asset or "-" in quote_asset:
+                self.logger().debug(
+                    "Skipping trading rule for %s_%s because token contains hyphen",
+                    base_asset,
+                    quote_asset,
+                )
+                continue
             trading_pair = _combine_trading_pair(base_asset, quote_asset)
             min_price = self._decimal_from_value(entry.get("minPrice") or entry.get("tickSize") or entry.get("min_price") or Decimal("1e-8"))
             min_amount = self._decimal_from_value(entry.get("minAmount") or entry.get("minQty") or entry.get("min_amount") or Decimal("1e-8"))
-            trading_rules.append(
-                TradingRule(
+            try:
+                trading_rule = TradingRule(
                     trading_pair=trading_pair,
                     min_order_size=min_amount,
                     min_price_increment=min_price,
                     min_base_amount_increment=min_amount,
                     min_quote_amount_increment=min_price,
                 )
-            )
+            except Exception as exc:
+                self.logger().warning("Skipping trading rule for %s: %s", trading_pair, exc)
+                continue
+            trading_rules.append(trading_rule)
         return trading_rules
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+from contextlib import suppress
 from typing import Any, Dict, List, Optional
 
 from hummingbot.connector.exchange.biconomy import biconomy_constants as CONSTANTS
@@ -31,6 +32,8 @@ class BiconomyAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._domain = domain
         self._api_factory = api_factory
         self._message_id = 0
+        self._last_event_timestamp = 0.0
+        self._ping_task: Optional[asyncio.Task] = None
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -42,6 +45,7 @@ class BiconomyAPIUserStreamDataSource(UserStreamTrackerDataSource):
         ws = await self._api_factory.get_ws_assistant()
         await ws.connect(ws_url=CONSTANTS.WS_PUBLIC_URL, ping_timeout=CONSTANTS.HEARTBEAT_INTERVAL)
         await self._authenticate(ws)
+        await self._start_ping_loop(ws)
         return ws
 
     async def _authenticate(self, ws: WSAssistant):
@@ -71,7 +75,7 @@ class BiconomyAPIUserStreamDataSource(UserStreamTrackerDataSource):
         asset_request = WSJSONRequest(
             payload={
                 "method": "asset.subscribe",
-                "params": [],
+                "params": self._assets_to_subscribe(),
                 "id": self._next_message_id(),
             }
         )
@@ -90,6 +94,8 @@ class BiconomyAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
             if not message:
                 continue
+
+            self._last_event_timestamp = time.time()
 
             if isinstance(message, dict):
                 method = message.get("method")
@@ -132,6 +138,51 @@ class BiconomyAPIUserStreamDataSource(UserStreamTrackerDataSource):
         )
         await websocket_assistant.send(ping_request)
 
+    async def _start_ping_loop(self, websocket_assistant: WSAssistant):
+        await self._cancel_ping_task()
+        self._ping_task = asyncio.create_task(self._ping_loop(websocket_assistant))
+
+    async def _ping_loop(self, websocket_assistant: WSAssistant):
+        interval = max(30.0, float(CONSTANTS.HEARTBEAT_INTERVAL) - 30.0)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await self._send_ping(websocket_assistant)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # pragma: no cover - network hiccups
+                    self.logger().warning("Failed to send Biconomy user-stream ping", exc_info=True)
+        except asyncio.CancelledError:
+            return
+
+    async def _on_user_stream_interruption(self, websocket_assistant: Optional[WSAssistant]):
+        await self._cancel_ping_task()
+        await super()._on_user_stream_interruption(websocket_assistant)
+
+    async def _cancel_ping_task(self):
+        if self._ping_task is not None:
+            self._ping_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._ping_task
+            self._ping_task = None
+
     def _next_message_id(self) -> int:
         self._message_id += 1
         return self._message_id
+
+    def _assets_to_subscribe(self) -> List[str]:
+        assets = set()
+        for trading_pair in self._trading_pairs:
+            try:
+                base, quote = trading_pair.split("-")
+            except ValueError:
+                continue
+            assets.add(base)
+            assets.add(quote)
+
+        return sorted(assets)
+
+    @property
+    def last_event_timestamp(self) -> float:
+        return self._last_event_timestamp

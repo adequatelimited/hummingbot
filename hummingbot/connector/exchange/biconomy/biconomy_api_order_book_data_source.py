@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.connector.exchange.biconomy import biconomy_constants as CONSTANTS, biconomy_web_utils as web_utils
@@ -29,6 +30,7 @@ class BiconomyAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._domain = domain
         self._api_factory = api_factory
         self._message_id = 0
+        self._ping_task: Optional[asyncio.Task] = None
 
     async def get_last_traded_prices(
         self, trading_pairs: List[str], domain: Optional[str] = None
@@ -109,6 +111,7 @@ class BiconomyAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws = await self._api_factory.get_ws_assistant()
         await ws.connect(ws_url=CONSTANTS.WS_PUBLIC_URL, ping_timeout=CONSTANTS.HEARTBEAT_INTERVAL)
+        await self._start_ping_loop(ws)
         return ws
 
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
@@ -139,3 +142,35 @@ class BiconomyAPIOrderBookDataSource(OrderBookTrackerDataSource):
     def _next_message_id(self) -> int:
         self._message_id += 1
         return self._message_id
+
+    async def _start_ping_loop(self, websocket_assistant: WSAssistant):
+        await self._cancel_ping_task()
+        self._ping_task = asyncio.create_task(self._ping_loop(websocket_assistant))
+
+    async def _cancel_ping_task(self):
+        if self._ping_task is not None:
+            self._ping_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._ping_task
+            self._ping_task = None
+
+    async def _ping_loop(self, websocket_assistant: WSAssistant):
+        interval = max(30.0, float(CONSTANTS.HEARTBEAT_INTERVAL) - 30.0)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    ping_request = WSJSONRequest(
+                        payload={"method": "server.ping", "params": [], "id": self._next_message_id()},
+                    )
+                    await websocket_assistant.send(ping_request)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # pragma: no cover - network hiccups
+                    self.logger().warning("Failed to send Biconomy order-book ping", exc_info=True)
+        except asyncio.CancelledError:
+            return
+
+    async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
+        await self._cancel_ping_task()
+        await super()._on_order_stream_interruption(websocket_assistant)
