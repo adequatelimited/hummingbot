@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -31,6 +32,11 @@ class BiconomyAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._api_factory = api_factory
         self._message_id = 0
         self._ping_task: Optional[asyncio.Task] = None
+        self._last_client_ping_ts = 0.0
+        self._last_server_ping_ts = 0.0
+        self._last_pong_sent_ts = 0.0
+        self._last_event_timestamp = 0.0
+        self._active_ws: Optional[WSAssistant] = None
 
     async def get_last_traded_prices(
         self, trading_pairs: List[str], domain: Optional[str] = None
@@ -61,6 +67,7 @@ class BiconomyAPIOrderBookDataSource(OrderBookTrackerDataSource):
         trades = params[1] or []
         trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
         trade_messages = BiconomyOrderBook.trade_messages_from_ws(trades=trades, trading_pair=trading_pair)
+        self._last_event_timestamp = self._time()
         for message in trade_messages:
             message_queue.put_nowait(message)
 
@@ -71,11 +78,13 @@ class BiconomyAPIOrderBookDataSource(OrderBookTrackerDataSource):
         symbol = params[2]
         depth_payload = params[1]
         trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+        event_time = self._time()
         diff_message = BiconomyOrderBook.diff_message_from_ws(
             depth_payload=depth_payload,
             trading_pair=trading_pair,
-            timestamp=self._time(),
+            timestamp=event_time,
         )
+        self._last_event_timestamp = event_time
         message_queue.put_nowait(diff_message)
 
     async def _parse_order_book_snapshot_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
@@ -85,11 +94,13 @@ class BiconomyAPIOrderBookDataSource(OrderBookTrackerDataSource):
         symbol = params[2]
         depth_payload = params[1]
         trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+        event_time = self._time()
         snapshot_message = BiconomyOrderBook.snapshot_message_from_ws(
             depth_payload=depth_payload,
             trading_pair=trading_pair,
-            timestamp=self._time(),
+            timestamp=event_time,
         )
+        self._last_event_timestamp = event_time
         message_queue.put_nowait(snapshot_message)
 
     async def _subscribe_channels(self, ws: WSAssistant):
@@ -110,7 +121,13 @@ class BiconomyAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws = await self._api_factory.get_ws_assistant()
-        await ws.connect(ws_url=CONSTANTS.WS_PUBLIC_URL, ping_timeout=CONSTANTS.HEARTBEAT_INTERVAL)
+        await ws.connect(
+            ws_url=CONSTANTS.WS_PUBLIC_URL,
+            ping_timeout=CONSTANTS.HEARTBEAT_INTERVAL,
+            ws_headers=dict(CONSTANTS.WS_REQUEST_HEADERS),
+        )
+        self._active_ws = ws
+        self._log_ws_event("connected", heartbeat=CONSTANTS.HEARTBEAT_INTERVAL)
         await self._start_ping_loop(ws)
         return ws
 
@@ -130,10 +147,13 @@ class BiconomyAPIOrderBookDataSource(OrderBookTrackerDataSource):
     ):
         method = event_message.get("method")
         if method == "server.ping":
+            self._last_server_ping_ts = self._time()
             pong_request = WSJSONRequest(
                 payload={"method": "server.pong", "params": [], "id": event_message.get("id", self._next_message_id())}
             )
             await websocket_assistant.send(pong_request)
+            self._last_pong_sent_ts = self._time()
+            self._log_ws_event("server_ping", ping_id=event_message.get("id"))
         elif "result" in event_message:
             return
         elif event_message.get("error"):
@@ -160,10 +180,12 @@ class BiconomyAPIOrderBookDataSource(OrderBookTrackerDataSource):
             while True:
                 await asyncio.sleep(interval)
                 try:
+                    self._last_client_ping_ts = self._time()
                     ping_request = WSJSONRequest(
                         payload={"method": "server.ping", "params": [], "id": self._next_message_id()},
                     )
                     await websocket_assistant.send(ping_request)
+                    self._log_ws_event("client_ping", ping_id=self._message_id)
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # pragma: no cover - network hiccups
@@ -172,5 +194,41 @@ class BiconomyAPIOrderBookDataSource(OrderBookTrackerDataSource):
             return
 
     async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
+        await self._safe_close_websocket(websocket_assistant)
+        self._log_disconnect_summary()
         await self._cancel_ping_task()
-        await super()._on_order_stream_interruption(websocket_assistant)
+        await super()._on_order_stream_interruption(None)
+        if websocket_assistant is self._active_ws:
+            self._active_ws = None
+
+    def _log_ws_event(self, event: str, **metadata: Any):
+        if self.logger().isEnabledFor(logging.DEBUG):
+            details = " ".join(f"{key}={metadata[key]}" for key in sorted(metadata)) if metadata else ""
+            suffix = f" {details}" if details else ""
+            self.logger().debug(f"[biconomy-public-ws] {event}{suffix}")
+
+    def _log_disconnect_summary(self):
+        now = self._time()
+        last_event_age = now - self._last_event_timestamp if self._last_event_timestamp else None
+        server_ping_age = now - self._last_server_ping_ts if self._last_server_ping_ts else None
+        client_ping_age = now - self._last_client_ping_ts if self._last_client_ping_ts else None
+        pong_age = now - self._last_pong_sent_ts if self._last_pong_sent_ts else None
+        summary_parts = [
+            "summary=order-book",
+            f"last_event_age={last_event_age:.2f}s" if last_event_age is not None else "last_event_age=n/a",
+            f"last_server_ping_age={server_ping_age:.2f}s" if server_ping_age is not None else "last_server_ping_age=n/a",
+            f"last_client_ping_age={client_ping_age:.2f}s" if client_ping_age is not None else "last_client_ping_age=n/a",
+            f"last_pong_age={pong_age:.2f}s" if pong_age is not None else "last_pong_age=n/a",
+        ]
+        self.logger().info("Biconomy public stream disconnect %s", " ".join(summary_parts))
+
+    async def _safe_close_websocket(self, websocket_assistant: Optional[WSAssistant]):
+        if websocket_assistant is None:
+            return
+        try:
+            await websocket_assistant.disconnect()
+            self._log_ws_event("client_close")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().warning("Failed to close Biconomy public websocket cleanly", exc_info=True)

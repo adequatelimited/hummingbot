@@ -13,6 +13,9 @@ PRIVATE_API_VERSION = "api/v2"
 X_SITE_ID_HEADER = "127"
 X_SITE_ID_HEADER_KEY = "X-SITE-ID"
 CONTENT_TYPE = "application/x-www-form-urlencoded"
+WS_REQUEST_HEADERS = {
+    X_SITE_ID_HEADER_KEY: X_SITE_ID_HEADER,
+}
 
 # Public REST endpoints
 TICKERS_PATH_URL = "/tickers"
