@@ -49,6 +49,9 @@ portfolio_value.csv
 debug.log
 /installation/docker-commands/hummingbot_files
 
+# Local secrets (runtime credentials kept outside version control)
+conf/secrets/
+
 # Distribution files
 /build
 /dist

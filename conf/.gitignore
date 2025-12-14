@@ -1,3 +1,5 @@
 *.yml
 *.json
 .password_verification
+!controllers/qrl_micro_mm.yml
+!scripts/qrl_micro_mm.yml
